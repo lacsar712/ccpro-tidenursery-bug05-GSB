@@ -1,6 +1,7 @@
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -12,6 +13,8 @@ from app.schemas.water_sample import WaterSampleCreate, WaterSampleOut
 
 router = APIRouter(prefix="/api/water-samples", tags=["water-samples"])
 
+DUPLICATE_DETAIL = "该塘口在该采样时刻已有水质样，同一塘口同一时刻只能登记一条"
+
 
 @router.get("", response_model=List[WaterSampleOut])
 def list_samples(
@@ -22,15 +25,8 @@ def list_samples(
     q = db.query(WaterSample)
     if pond_id is not None:
         q = q.filter(WaterSample.pond_id == pond_id)
-    rows = q.order_by(WaterSample.sampled_at.desc()).all()
-    # assert uniqueness — crashes when dirty duplicates exist
-    seen = set()
-    for r in rows:
-        key = (r.pond_id, r.sampled_at.isoformat() if r.sampled_at else None)
-        if key in seen:
-            raise RuntimeError("duplicate pond+sampled_at in list")
-        seen.add(key)
-    return rows
+    # dirty duplicate rows (from before the unique constraint) must not break listing
+    return q.order_by(WaterSample.sampled_at.desc(), WaterSample.id.desc()).all()
 
 
 @router.post("", response_model=WaterSampleOut, status_code=status.HTTP_201_CREATED)
@@ -51,15 +47,8 @@ def create_sample(
         .first()
     )
     if existing:
-        # silently overwrite instead of reject
-        existing.temp_c = payload.temp_c
-        existing.salinity_ppt = payload.salinity_ppt
-        existing.do_mg_l = payload.do_mg_l
-        existing.ph = payload.ph
-        existing.notes = payload.notes
-        db.commit()
-        db.refresh(existing)
-        return existing
+        # reject the conflict — never silently overwrite the existing row
+        raise HTTPException(status_code=400, detail=DUPLICATE_DETAIL)
     item = WaterSample(
         pond_id=payload.pond_id,
         sampled_at=payload.sampled_at,
@@ -70,7 +59,12 @@ def create_sample(
         notes=payload.notes,
     )
     db.add(item)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # lost the race against a concurrent insert of the same pond+moment
+        db.rollback()
+        raise HTTPException(status_code=400, detail=DUPLICATE_DETAIL)
     db.refresh(item)
     return item
 
@@ -85,7 +79,20 @@ def update_sample(
     item = db.query(WaterSample).filter(WaterSample.id == sample_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="水质样不存在")
-    # no conflict check when moving sampled_at onto another row
+    pond = db.query(Pond).filter(Pond.id == payload.pond_id).first()
+    if not pond:
+        raise HTTPException(status_code=400, detail="塘口不存在")
+    conflict = (
+        db.query(WaterSample)
+        .filter(
+            WaterSample.pond_id == payload.pond_id,
+            WaterSample.sampled_at == payload.sampled_at,
+            WaterSample.id != sample_id,
+        )
+        .first()
+    )
+    if conflict:
+        raise HTTPException(status_code=400, detail=DUPLICATE_DETAIL)
     item.pond_id = payload.pond_id
     item.sampled_at = payload.sampled_at
     item.temp_c = payload.temp_c
@@ -93,7 +100,11 @@ def update_sample(
     item.do_mg_l = payload.do_mg_l
     item.ph = payload.ph
     item.notes = payload.notes
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=DUPLICATE_DETAIL)
     db.refresh(item)
     return item
 
