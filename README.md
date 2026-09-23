@@ -37,14 +37,14 @@ docker compose up --build
 - 后端健康检查：http://localhost:8400/api/health
 - API 文档：http://localhost:8400/docs
 
-后端 entrypoint 流程：等待数据库就绪 → `create_all` 建表 → seed 初始数据 → 启动 uvicorn。
+后端 entrypoint 流程：等待数据库就绪 → `create_all` 建表 → 幂等迁移（补唯一约束）→ seed 初始数据 → 启动 uvicorn。
 
 ## 功能模块
 
 1. **Auth**：JWT 登录（OAuth2 Password），`/api/auth/login`、`/api/auth/me`
 2. **Hatchery 育苗场**：`name`、`seawaterSource`、`notes`
 3. **Pond 育苗塘**：`hatcheryId`、`pondCode`、`species`、`volumeM3`、`status(stocked|dry|quarantine)`；同场 `pondCode` 唯一
-4. **WaterSample 水质样**：`pondId`、`sampledAt`、`tempC`、`salinityPpt`、`doMgL`、`ph`、`notes`；`doMgL > 0` 且 `ph ∈ [6,9]`，否则返回 **400**
+4. **WaterSample 水质样**：`pondId`、`sampledAt`、`tempC`、`salinityPpt`、`doMgL`、`ph`、`notes`；`doMgL > 0` 且 `ph ∈ [6,9]`，否则返回 **400**；同一塘口同一 `sampledAt` 仅允许一条（数据库唯一约束 `uq_water_samples_pond_sampled`），新增或改时刻撞已有记录返回 **409** 并说明原因，不会覆盖旧数据
 5. **FeedEvent 投喂**：`pondId`、`fedAt`、`feedType`、`amountKg`、`operatorName`
 6. **Dashboard**：塘总数、quarantine 数、近 24h 采样数、近 7 日投喂总量 kg
 

@@ -24,6 +24,9 @@ PY
 echo "Creating tables..."
 python -c "from app.database import Base, engine; from app import models; Base.metadata.create_all(bind=engine)"
 
+echo "Applying migrations..."
+python -c "from app.database import engine; from app.migrate import ensure_water_sample_uniqueness; ensure_water_sample_uniqueness(engine)"
+
 echo "Seeding data..."
 python -c "from app.seed import seed; seed()"
 

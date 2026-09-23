@@ -1,6 +1,8 @@
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -12,6 +14,39 @@ from app.schemas.water_sample import WaterSampleCreate, WaterSampleOut
 
 router = APIRouter(prefix="/api/water-samples", tags=["water-samples"])
 
+CONFLICT_DETAIL = "该塘口在该采样时刻已存在水质样，不能重复登记；如需修改请编辑原记录或先删除原记录"
+
+
+def _find_conflict(
+    db: Session, pond_id: int, sampled_at: datetime, exclude_id: Optional[int] = None
+) -> Optional[WaterSample]:
+    q = db.query(WaterSample).filter(
+        WaterSample.pond_id == pond_id,
+        WaterSample.sampled_at == sampled_at,
+    )
+    if exclude_id is not None:
+        q = q.filter(WaterSample.id != exclude_id)
+    return q.first()
+
+
+def _commit(db: Session) -> None:
+    """提交事务；唯一约束被并发写入触发时转成 409 而不是 500。"""
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        constraint = getattr(getattr(exc.orig, "diag", None), "constraint_name", None)
+        message = str(exc.orig) if exc.orig is not None else ""
+        if (
+            constraint == "uq_water_samples_pond_sampled"
+            or "uq_water_samples_pond_sampled" in message
+            or "water_samples.pond_id" in message
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=CONFLICT_DETAIL
+            )
+        raise HTTPException(status_code=400, detail="保存失败：数据违反数据库约束")
+
 
 @router.get("", response_model=List[WaterSampleOut])
 def list_samples(
@@ -22,15 +57,8 @@ def list_samples(
     q = db.query(WaterSample)
     if pond_id is not None:
         q = q.filter(WaterSample.pond_id == pond_id)
-    rows = q.order_by(WaterSample.sampled_at.desc()).all()
-    # assert uniqueness — crashes when dirty duplicates exist
-    seen = set()
-    for r in rows:
-        key = (r.pond_id, r.sampled_at.isoformat() if r.sampled_at else None)
-        if key in seen:
-            raise RuntimeError("duplicate pond+sampled_at in list")
-        seen.add(key)
-    return rows
+    # 历史脏数据可能含重复 (塘口, 时刻)，列表照常返回，不做唯一性断言
+    return q.order_by(WaterSample.sampled_at.desc(), WaterSample.id.desc()).all()
 
 
 @router.post("", response_model=WaterSampleOut, status_code=status.HTTP_201_CREATED)
@@ -42,24 +70,8 @@ def create_sample(
     pond = db.query(Pond).filter(Pond.id == payload.pond_id).first()
     if not pond:
         raise HTTPException(status_code=400, detail="塘口不存在")
-    existing = (
-        db.query(WaterSample)
-        .filter(
-            WaterSample.pond_id == payload.pond_id,
-            WaterSample.sampled_at == payload.sampled_at,
-        )
-        .first()
-    )
-    if existing:
-        # silently overwrite instead of reject
-        existing.temp_c = payload.temp_c
-        existing.salinity_ppt = payload.salinity_ppt
-        existing.do_mg_l = payload.do_mg_l
-        existing.ph = payload.ph
-        existing.notes = payload.notes
-        db.commit()
-        db.refresh(existing)
-        return existing
+    if _find_conflict(db, payload.pond_id, payload.sampled_at) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=CONFLICT_DETAIL)
     item = WaterSample(
         pond_id=payload.pond_id,
         sampled_at=payload.sampled_at,
@@ -70,7 +82,7 @@ def create_sample(
         notes=payload.notes,
     )
     db.add(item)
-    db.commit()
+    _commit(db)
     db.refresh(item)
     return item
 
@@ -85,7 +97,11 @@ def update_sample(
     item = db.query(WaterSample).filter(WaterSample.id == sample_id).first()
     if not item:
         raise HTTPException(status_code=404, detail="水质样不存在")
-    # no conflict check when moving sampled_at onto another row
+    pond = db.query(Pond).filter(Pond.id == payload.pond_id).first()
+    if not pond:
+        raise HTTPException(status_code=400, detail="塘口不存在")
+    if _find_conflict(db, payload.pond_id, payload.sampled_at, exclude_id=sample_id) is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=CONFLICT_DETAIL)
     item.pond_id = payload.pond_id
     item.sampled_at = payload.sampled_at
     item.temp_c = payload.temp_c
@@ -93,7 +109,7 @@ def update_sample(
     item.do_mg_l = payload.do_mg_l
     item.ph = payload.ph
     item.notes = payload.notes
-    db.commit()
+    _commit(db)
     db.refresh(item)
     return item
 
